@@ -17,7 +17,11 @@ import {
   ChevronDown,
   ExternalLink,
   ShieldCheck,
-  BookOpen
+  BookOpen,
+  Download,
+  Pencil,
+  Save,
+  X
 } from 'lucide-react';
 
 interface Attendee {
@@ -29,14 +33,33 @@ interface Attendee {
 }
 
 const EVENT_DATE = new Date('2026-03-29T09:00:00');
-const WHATSAPP_NUMBER = '6281234567890'; 
+const WHATSAPP_NUMBER = '6285330351335';
+const APPS_SCRIPT_URL = (import.meta.env.VITE_APPS_SCRIPT_URL || '').trim();
+
+async function parseJsonSafely(response: Response) {
+  const raw = await response.text();
+  if (!raw) return {};
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return { raw };
+  }
+}
 
 export default function App() {
+  const audioRef = React.useRef<HTMLAudioElement | null>(null);
   const [attendees, setAttendees] = useState<Attendee[]>([
     { id: '1', name: '', address: '', count: 1 }
   ]);
   const [confirmedAttendees, setConfirmedAttendees] = useState<Attendee[]>([]);
   const [isLoading, setIsLoading] = useState(true);
+  const [editingAttendeeId, setEditingAttendeeId] = useState<string | null>(null);
+  const [editDraft, setEditDraft] = useState<{ name: string; address: string; count: number; created_at?: string }>({
+    name: '',
+    address: '',
+    count: 1
+  });
+  const [actionAttendeeId, setActionAttendeeId] = useState<string | null>(null);
   const [timeLeft, setTimeLeft] = useState({
     days: 0,
     hours: 0,
@@ -63,13 +86,56 @@ export default function App() {
     return () => clearInterval(timer);
   }, []);
 
+  useEffect(() => {
+    const audio = audioRef.current;
+    if (!audio) return;
+    const tryPlay = () => {
+      audio.play().catch(() => {});
+    };
+
+    audio.loop = true;
+    audio.volume = 0.35;
+    tryPlay();
+
+    const interactionEvents: Array<keyof WindowEventMap> = ['click', 'touchstart', 'keydown', 'scroll'];
+    const startOnInteraction = () => tryPlay();
+    const resumeOnFocus = () => {
+      if (document.visibilityState === 'visible') tryPlay();
+    };
+    const keepPlaying = () => {
+      if (document.visibilityState === 'visible') tryPlay();
+    };
+
+    interactionEvents.forEach((eventName) => {
+      window.addEventListener(eventName, startOnInteraction, { passive: true });
+    });
+    window.addEventListener('focus', resumeOnFocus);
+    document.addEventListener('visibilitychange', resumeOnFocus);
+    audio.addEventListener('pause', keepPlaying);
+
+    return () => {
+      interactionEvents.forEach((eventName) => {
+        window.removeEventListener(eventName, startOnInteraction);
+      });
+      window.removeEventListener('focus', resumeOnFocus);
+      document.removeEventListener('visibilitychange', resumeOnFocus);
+      audio.removeEventListener('pause', keepPlaying);
+    };
+  }, []);
+
   const fetchAttendees = async () => {
     try {
-      const response = await fetch('/api/attendees');
-      if (response.ok) {
-        const data = await response.json();
-        setConfirmedAttendees(data);
+      const response = APPS_SCRIPT_URL
+        ? await fetch(`${APPS_SCRIPT_URL}?action=list`)
+        : await fetch('/api/attendees');
+
+      const data = await parseJsonSafely(response);
+      if (!response.ok || data?.success === false) {
+        throw new Error(data?.detail || data?.error || 'Gagal memuat daftar tamu.');
       }
+
+      const rows = Array.isArray(data) ? data : data?.data;
+      setConfirmedAttendees(Array.isArray(rows) ? rows : []);
     } catch (error) {
       console.error("Error fetching confirmed attendees:", error);
     } finally {
@@ -95,19 +161,34 @@ export default function App() {
   };
 
   const handleSendWhatsApp = async () => {
-    // Save to database first
+    // Save to storage first
     try {
       const validAttendees = attendees.filter(a => a.name.trim());
       if (validAttendees.length > 0) {
-        await fetch('/api/attendees', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ attendees: validAttendees })
-        });
-        fetchAttendees(); // Refresh list
+        const response = APPS_SCRIPT_URL
+          ? await fetch(APPS_SCRIPT_URL, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
+              body: new URLSearchParams({
+                action: 'create',
+                attendees: JSON.stringify(validAttendees)
+              })
+            })
+          : await fetch('/api/attendees', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ attendees: validAttendees })
+            });
+
+        const data = await parseJsonSafely(response);
+        if (!response.ok || data?.success === false) {
+          throw new Error(data?.detail || data?.error || 'Gagal menyimpan daftar tamu.');
+        }
+        fetchAttendees();
       }
     } catch (error) {
       console.error("Error saving attendees:", error);
+      alert(error instanceof Error ? error.message : 'Gagal menyimpan daftar tamu.');
     }
 
     let message = `Assalamu’alaikum Warahmatullahi Wabarakatuh.\n\n`;
@@ -130,8 +211,222 @@ export default function App() {
     window.open(`https://wa.me/${WHATSAPP_NUMBER}?text=${encodedMessage}`, '_blank');
   };
 
+  const handleDownloadGuestList = () => {
+    if (confirmedAttendees.length === 0) {
+      alert('Belum ada data tamu untuk diunduh.');
+      return;
+    }
+
+    const sanitizeText = (value: string) =>
+      value
+        .replace(/[^\x20-\x7E]/g, ' ')
+        .replace(/\\/g, '\\\\')
+        .replace(/\(/g, '\\(')
+        .replace(/\)/g, '\\)');
+
+    const wrapLine = (text: string, max = 95) => {
+      if (text.length <= max) return [text];
+      const words = text.split(' ');
+      const lines: string[] = [];
+      let current = '';
+      for (const word of words) {
+        const next = current ? `${current} ${word}` : word;
+        if (next.length > max) {
+          if (current) lines.push(current);
+          current = word;
+        } else {
+          current = next;
+        }
+      }
+      if (current) lines.push(current);
+      return lines;
+    };
+
+    const totalOrang = confirmedAttendees.reduce((acc, curr) => acc + curr.count, 0);
+    const exportDate = new Date().toLocaleString('id-ID');
+    const lines: string[] = [
+      'Daftar Tamu Silaturahmi Dzurriyah Sunan Drajad',
+      `Tanggal unduh: ${exportDate}`,
+      `Jumlah pendaftar: ${confirmedAttendees.length} Tamu`,
+      `Total hadir: ${totalOrang} Orang`,
+      '------------------------------------------------------------'
+    ];
+
+    confirmedAttendees.forEach((attendee, index) => {
+      const tanggal = attendee.created_at ? new Date(attendee.created_at).toLocaleString('id-ID') : '-';
+      const base = `${index + 1}. ${attendee.name || '-'} | ${attendee.count} orang | ${tanggal}`;
+      lines.push(...wrapLine(base));
+      lines.push(...wrapLine(`   Alamat: ${attendee.address || '-'}`));
+      lines.push('');
+    });
+
+    const linesPerPage = 48;
+    const pages: string[][] = [];
+    for (let i = 0; i < lines.length; i += linesPerPage) {
+      pages.push(lines.slice(i, i + linesPerPage));
+    }
+
+    const objects: Record<number, string> = {};
+    const pageCount = pages.length || 1;
+    const firstPageObj = 3;
+    const fontObjNum = firstPageObj + pageCount * 2;
+    const maxObj = fontObjNum;
+
+    objects[1] = '<< /Type /Catalog /Pages 2 0 R >>';
+    objects[2] = `<< /Type /Pages /Count ${pageCount} /Kids [${Array.from({ length: pageCount }, (_, i) => `${firstPageObj + i * 2} 0 R`).join(' ')}] >>`;
+
+    pages.forEach((pageLines, i) => {
+      const pageObjNum = firstPageObj + i * 2;
+      const contentObjNum = pageObjNum + 1;
+
+      const contentLines = [
+        'BT',
+        '/F1 10 Tf',
+        '40 800 Td',
+        ...pageLines.flatMap((line, lineIndex) => {
+          const escaped = sanitizeText(line);
+          if (lineIndex === 0) return [`(${escaped}) Tj`];
+          return ['0 -15 Td', `(${escaped}) Tj`];
+        }),
+        'ET'
+      ];
+      const stream = contentLines.join('\n');
+
+      objects[pageObjNum] = `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 ${fontObjNum} 0 R >> >> /Contents ${contentObjNum} 0 R >>`;
+      objects[contentObjNum] = `<< /Length ${stream.length} >>\nstream\n${stream}\nendstream`;
+    });
+
+    objects[fontObjNum] = '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>';
+
+    let pdf = '%PDF-1.4\n';
+    const offsets: number[] = new Array(maxObj + 1).fill(0);
+    for (let i = 1; i <= maxObj; i++) {
+      offsets[i] = pdf.length;
+      pdf += `${i} 0 obj\n${objects[i]}\nendobj\n`;
+    }
+
+    const xrefStart = pdf.length;
+    pdf += `xref\n0 ${maxObj + 1}\n`;
+    pdf += '0000000000 65535 f \n';
+    for (let i = 1; i <= maxObj; i++) {
+      pdf += `${String(offsets[i]).padStart(10, '0')} 00000 n \n`;
+    }
+    pdf += `trailer\n<< /Size ${maxObj + 1} /Root 1 0 R >>\nstartxref\n${xrefStart}\n%%EOF`;
+
+    const blob = new Blob([pdf], { type: 'application/pdf' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    const dateStamp = new Date().toISOString().slice(0, 10);
+    link.href = url;
+    link.download = `guestlist-drajad-${dateStamp}.pdf`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  };
+
+  const startEditConfirmedAttendee = (attendee: Attendee) => {
+    setEditingAttendeeId(attendee.id);
+    setEditDraft({
+      name: attendee.name,
+      address: attendee.address,
+      count: attendee.count,
+      created_at: attendee.created_at
+    });
+  };
+
+  const cancelEditConfirmedAttendee = () => {
+    setEditingAttendeeId(null);
+    setEditDraft({ name: '', address: '', count: 1 });
+  };
+
+  const saveEditConfirmedAttendee = async (id: string) => {
+    if (!editDraft.name.trim()) {
+      alert('Nama tamu wajib diisi.');
+      return;
+    }
+
+    setActionAttendeeId(id);
+    try {
+      const response = APPS_SCRIPT_URL
+        ? await fetch(APPS_SCRIPT_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
+            body: new URLSearchParams({
+              action: 'update',
+              id,
+              name: editDraft.name.trim(),
+              address: editDraft.address.trim(),
+              count: String(Math.max(1, Number(editDraft.count || 1))),
+              created_at: editDraft.created_at || ''
+            })
+          })
+        : await fetch(`/api/attendees/${encodeURIComponent(id)}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              name: editDraft.name.trim(),
+              address: editDraft.address.trim(),
+              count: Math.max(1, Number(editDraft.count || 1)),
+              created_at: editDraft.created_at
+            })
+          });
+
+      const data = await parseJsonSafely(response);
+      if (!response.ok || data?.success === false) {
+        throw new Error(data?.detail || data?.error || 'Gagal mengedit data tamu.');
+      }
+
+      setEditingAttendeeId(null);
+      await fetchAttendees();
+    } catch (error) {
+      console.error('Error updating attendee:', error);
+      alert(error instanceof Error ? error.message : 'Gagal mengedit data tamu.');
+    } finally {
+      setActionAttendeeId(null);
+    }
+  };
+
+  const deleteConfirmedAttendee = async (id: string) => {
+    const isConfirmed = window.confirm('Hapus data tamu ini dari daftar?');
+    if (!isConfirmed) return;
+
+    setActionAttendeeId(id);
+    try {
+      const response = APPS_SCRIPT_URL
+        ? await fetch(APPS_SCRIPT_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
+            body: new URLSearchParams({
+              action: 'delete',
+              id
+            })
+          })
+        : await fetch(`/api/attendees/${encodeURIComponent(id)}`, {
+            method: 'DELETE'
+          });
+
+      const data = await parseJsonSafely(response);
+      if (!response.ok || data?.success === false) {
+        throw new Error(data?.detail || data?.error || 'Gagal menghapus data tamu.');
+      }
+
+      if (editingAttendeeId === id) {
+        cancelEditConfirmedAttendee();
+      }
+      await fetchAttendees();
+    } catch (error) {
+      console.error('Error deleting attendee:', error);
+      alert(error instanceof Error ? error.message : 'Gagal menghapus data tamu.');
+    } finally {
+      setActionAttendeeId(null);
+    }
+  };
+
   return (
     <div className="min-h-screen pb-20 overflow-x-hidden selection:bg-accent selection:text-white">
+      <audio ref={audioRef} src="/audio/aiduun-saeed.mp3" loop preload="auto" />
+
       {/* Hero Section */}
       <section className="relative h-screen flex items-center justify-center text-center px-6 overflow-hidden">
         <div className="absolute inset-0 z-0">
@@ -240,7 +535,7 @@ export default function App() {
                   <p className="text-lg text-neutral-700 font-bold">Rumah H. Taufiqur Rohman</p>
                   <p className="text-neutral-600">Perumahan Istana Tajmahal, Kec. Blega, Kab. Bangkalan, Madura</p>
                   <a 
-                    href="https://maps.app.goo.gl/zbqf9Vf62SF3n6sC6" 
+                    href="https://www.google.com/maps/search/?api=1&query=-7.121360%2C113.072796" 
                     target="_blank" 
                     rel="noopener noreferrer"
                     className="inline-flex items-center gap-2 text-accent font-bold mt-4 hover:text-primary transition-colors border-b border-accent/30 pb-1"
@@ -248,6 +543,37 @@ export default function App() {
                     Petunjuk Arah <ExternalLink size={16} />
                   </a>
                 </div>
+              </div>
+            </div>
+          </motion.div>
+
+          {/* Mobile-only map placement: right below lokasi kediaman */}
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            whileInView={{ opacity: 1, y: 0 }}
+            viewport={{ once: true }}
+            className="md:hidden glass-card overflow-hidden p-2 relative group"
+          >
+            <div className="relative w-full h-[320px] rounded-xl overflow-hidden shadow-inner">
+              <iframe
+                src="https://maps.google.com/maps?q=-7.121360,113.072796&z=18&output=embed"
+                width="100%"
+                height="100%"
+                style={{ border: 0 }}
+                allowFullScreen={true}
+                loading="lazy"
+                referrerPolicy="no-referrer-when-downgrade"
+                title="Map Preview Mobile"
+              ></iframe>
+              <div className="absolute bottom-4 right-4">
+                <a
+                  href="https://www.google.com/maps/search/?api=1&query=-7.121360%2C113.072796"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="bg-white text-primary px-4 py-3 rounded-lg shadow-xl font-bold flex items-center gap-2 hover:bg-primary hover:text-white transition-all"
+                >
+                  <MapPin size={18} /> Buka Navigasi
+                </a>
               </div>
             </div>
           </motion.div>
@@ -272,7 +598,7 @@ export default function App() {
       </section>
 
       {/* Map Preview Section */}
-      <section className="max-w-5xl mx-auto px-6 pb-24">
+      <section className="hidden md:block max-w-5xl mx-auto px-6 pb-24">
         <div className="text-center mb-8">
           <h2 className="text-3xl font-bold text-primary mb-2">Lokasi Acara</h2>
           <p className="text-neutral-500">Klik peta untuk interaksi lebih lanjut atau gunakan tombol navigasi</p>
@@ -285,7 +611,7 @@ export default function App() {
         >
           <div className="relative w-full h-[450px] rounded-xl overflow-hidden shadow-inner">
             <iframe 
-              src="https://www.google.com/maps/embed?pb=!1m18!1m12!1m3!1d3959.456846387031!2d113.0886234!3d-7.0729111!2m3!1f0!2f0!3f0!3m2!1i1024!2i768!4f13.1!3m3!1m2!1s0x2dd7f94e63f963f9%3A0x10f63f963f963f96!2sPerumahan%20Istana%20Tajmahal!5e0!3m2!1sid!2sid!4v1709641184000!5m2!1sid!2sid" 
+              src="https://maps.google.com/maps?q=-7.121360,113.072796&z=18&output=embed" 
               width="100%" 
               height="100%" 
               style={{ border: 0 }} 
@@ -298,7 +624,7 @@ export default function App() {
             {/* Overlay Buttons for Interactivity */}
             <div className="absolute bottom-6 right-6 flex flex-col gap-3">
               <a 
-                href="https://maps.app.goo.gl/zbqf9Vf62SF3n6sC6" 
+                href="https://www.google.com/maps/search/?api=1&query=-7.121360%2C113.072796" 
                 target="_blank" 
                 rel="noopener noreferrer"
                 className="bg-white text-primary px-4 py-3 rounded-lg shadow-xl font-bold flex items-center gap-2 hover:bg-primary hover:text-white transition-all transform hover:-translate-y-1"
@@ -307,7 +633,7 @@ export default function App() {
               </a>
               <button 
                 onClick={() => {
-                  navigator.clipboard.writeText("Perumahan Istana Tajmahal, Kec. Blega, Kab. Bangkalan, Madura");
+                  navigator.clipboard.writeText("-7.121360, 113.072796");
                   alert("Alamat berhasil disalin!");
                 }}
                 className="bg-white text-primary px-4 py-3 rounded-lg shadow-xl font-bold flex items-center gap-2 hover:bg-accent hover:text-white transition-all transform hover:-translate-y-1"
@@ -426,14 +752,24 @@ export default function App() {
         <div className="text-center mb-12">
           <h2 className="text-3xl font-bold text-primary mb-2">Tamu yang Telah Mengonfirmasi</h2>
           <div className="w-16 h-1 bg-accent mx-auto mb-4"></div>
+          <p className="text-neutral-500 italic">Jumlah pendaftar: {confirmedAttendees.length} Tamu</p>
           <p className="text-neutral-500 italic">Total: {confirmedAttendees.reduce((acc, curr) => acc + curr.count, 0)} Orang</p>
+          <button
+            onClick={handleDownloadGuestList}
+            className="mt-5 inline-flex items-center gap-2 bg-primary text-gold px-4 py-2 rounded-lg font-bold hover:opacity-90 transition-opacity"
+          >
+            <Download size={16} /> Download PDF Daftar Tamu
+          </button>
         </div>
 
         <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
           {isLoading ? (
             <div className="col-span-full text-center py-10 text-neutral-400">Memuat daftar tamu...</div>
           ) : confirmedAttendees.length > 0 ? (
-            confirmedAttendees.map((attendee) => (
+            confirmedAttendees.map((attendee) => {
+              const isEditing = editingAttendeeId === attendee.id;
+              const isActing = actionAttendeeId === attendee.id;
+              return (
               <motion.div 
                 key={attendee.id}
                 initial={{ opacity: 0, scale: 0.95 }}
@@ -442,21 +778,89 @@ export default function App() {
                 className="bg-white p-4 rounded-xl shadow-sm border border-accent/10 flex flex-col justify-between"
               >
                 <div>
-                  <h4 className="font-bold text-primary truncate">{attendee.name}</h4>
-                  <p className="text-xs text-neutral-500 flex items-center gap-1 mt-1">
-                    <MapPin size={12} /> {attendee.address}
-                  </p>
+                  {isEditing ? (
+                    <div className="space-y-2">
+                      <input
+                        type="text"
+                        value={editDraft.name}
+                        onChange={(e) => setEditDraft({ ...editDraft, name: e.target.value })}
+                        className="w-full border border-accent/30 rounded-md px-2 py-1 text-sm"
+                        placeholder="Nama tamu"
+                      />
+                      <input
+                        type="text"
+                        value={editDraft.address}
+                        onChange={(e) => setEditDraft({ ...editDraft, address: e.target.value })}
+                        className="w-full border border-accent/30 rounded-md px-2 py-1 text-sm"
+                        placeholder="Alamat"
+                      />
+                      <input
+                        type="number"
+                        min={1}
+                        value={editDraft.count}
+                        onChange={(e) => setEditDraft({ ...editDraft, count: Number(e.target.value || 1) })}
+                        className="w-full border border-accent/30 rounded-md px-2 py-1 text-sm"
+                      />
+                    </div>
+                  ) : (
+                    <>
+                      <h4 className="font-bold text-primary truncate">{attendee.name}</h4>
+                      <p className="text-xs text-neutral-500 flex items-center gap-1 mt-1">
+                        <MapPin size={12} /> {attendee.address}
+                      </p>
+                    </>
+                  )}
                 </div>
-                <div className="mt-3 flex justify-between items-center border-t border-neutral-50 pt-2">
-                  <span className="text-[10px] text-neutral-400">
-                    {attendee.created_at ? new Date(attendee.created_at).toLocaleDateString('id-ID') : ''}
-                  </span>
-                  <span className="bg-accent/10 text-accent text-xs font-bold px-2 py-1 rounded-full">
-                    {attendee.count} Orang
-                  </span>
+                <div className="mt-3 border-t border-neutral-50 pt-2 space-y-2">
+                  <div className="flex justify-between items-center">
+                    <span className="text-[10px] text-neutral-400">
+                      {attendee.created_at ? new Date(attendee.created_at).toLocaleDateString('id-ID') : ''}
+                    </span>
+                    <span className="bg-accent/10 text-accent text-xs font-bold px-2 py-1 rounded-full">
+                      {(isEditing ? editDraft.count : attendee.count)} Orang
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-end gap-2">
+                    {isEditing ? (
+                      <>
+                        <button
+                          onClick={() => saveEditConfirmedAttendee(attendee.id)}
+                          disabled={isActing}
+                          className="px-2 py-1 text-xs rounded bg-primary text-gold font-bold disabled:opacity-50 inline-flex items-center gap-1"
+                        >
+                          <Save size={12} /> Simpan
+                        </button>
+                        <button
+                          onClick={cancelEditConfirmedAttendee}
+                          disabled={isActing}
+                          className="px-2 py-1 text-xs rounded bg-neutral-200 text-neutral-700 font-bold disabled:opacity-50 inline-flex items-center gap-1"
+                        >
+                          <X size={12} /> Batal
+                        </button>
+                      </>
+                    ) : (
+                      <>
+                        <button
+                          onClick={() => startEditConfirmedAttendee(attendee)}
+                          disabled={isActing}
+                          className="px-2 py-1 text-xs rounded bg-accent/10 text-accent font-bold disabled:opacity-50 inline-flex items-center gap-1"
+                        >
+                          <Pencil size={12} /> Edit
+                        </button>
+                        <button
+                          onClick={() => deleteConfirmedAttendee(attendee.id)}
+                          disabled={isActing}
+                          className="px-2 py-1 text-xs rounded bg-red-100 text-red-700 font-bold disabled:opacity-50 inline-flex items-center gap-1"
+                        >
+                          <Trash2 size={12} /> Hapus
+                        </button>
+                      </>
+                    )}
+                  </div>
                 </div>
               </motion.div>
-            ))
+              );
+            })
           ) : (
             <div className="col-span-full text-center py-10 text-neutral-400 italic">Belum ada tamu yang mengonfirmasi.</div>
           )}
