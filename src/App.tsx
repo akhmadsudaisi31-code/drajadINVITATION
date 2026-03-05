@@ -48,6 +48,7 @@ async function parseJsonSafely(response: Response) {
 
 export default function App() {
   const audioRef = React.useRef<HTMLAudioElement | null>(null);
+  const [needsMusicStart, setNeedsMusicStart] = useState(false);
   const [attendees, setAttendees] = useState<Attendee[]>([
     { id: '1', name: '', address: '', count: 1 }
   ]);
@@ -89,15 +90,20 @@ export default function App() {
   useEffect(() => {
     const audio = audioRef.current;
     if (!audio) return;
-    const tryPlay = () => {
-      audio.play().catch(() => {});
+    const tryPlay = async () => {
+      try {
+        await audio.play();
+        setNeedsMusicStart(false);
+      } catch {
+        setNeedsMusicStart(true);
+      }
     };
 
     audio.loop = true;
     audio.volume = 0.35;
     tryPlay();
 
-    const interactionEvents: Array<keyof WindowEventMap> = ['click', 'touchstart', 'keydown', 'scroll'];
+    const interactionEvents: Array<keyof WindowEventMap> = ['click', 'touchstart', 'keydown'];
     const startOnInteraction = () => tryPlay();
     const resumeOnFocus = () => {
       if (document.visibilityState === 'visible') tryPlay();
@@ -425,7 +431,19 @@ export default function App() {
 
   return (
     <div className="min-h-screen pb-20 overflow-x-hidden selection:bg-accent selection:text-white">
-      <audio ref={audioRef} src="/audio/aiduun-saeed.mp3" loop preload="auto" />
+      <audio ref={audioRef} src="/audio/aiduun-saeed.mp3" loop preload="auto" playsInline />
+      {needsMusicStart && (
+        <button
+          onClick={() => {
+            const audio = audioRef.current;
+            if (!audio) return;
+            audio.play().then(() => setNeedsMusicStart(false)).catch(() => setNeedsMusicStart(true));
+          }}
+          className="fixed bottom-5 right-5 z-50 bg-primary text-gold px-4 py-2 rounded-full shadow-xl border border-gold/30"
+        >
+          Aktifkan Musik
+        </button>
+      )}
 
       {/* Hero Section */}
       <section className="relative h-screen flex items-center justify-center text-center px-6 overflow-hidden">
