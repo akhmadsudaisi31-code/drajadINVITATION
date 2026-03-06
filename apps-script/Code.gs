@@ -1,4 +1,5 @@
 const SHEET_NAME = 'attendees';
+const SHEET_HEADERS = ['id', 'name', 'address', 'count', 'created_at'];
 
 function doGet(e) {
   const action = (e && e.parameter && e.parameter.action) || 'list';
@@ -23,7 +24,7 @@ function doPost(e) {
     }
 
     if (action === 'delete') {
-      deleteAttendee_(params.id);
+      deleteAttendee_(params.id, params.row_num);
       return jsonOutput({ success: true });
     }
 
@@ -42,38 +43,39 @@ function getSheet_() {
 
 function ensureHeader_(sheet) {
   if (sheet.getLastRow() === 0) {
-    sheet.appendRow(['id', 'name', 'address', 'count', 'created_at']);
+    sheet.appendRow(SHEET_HEADERS);
     return;
   }
 
-  const header = sheet.getRange(1, 1, 1, 5).getValues()[0];
+  const header = sheet.getRange(1, 1, 1, SHEET_HEADERS.length).getValues()[0];
   if (String(header[0]).toLowerCase() !== 'id') {
     sheet.insertRowBefore(1);
-    sheet.getRange(1, 1, 1, 5).setValues([['id', 'name', 'address', 'count', 'created_at']]);
+    sheet.getRange(1, 1, 1, SHEET_HEADERS.length).setValues([SHEET_HEADERS]);
   }
 }
 
 function listAttendees_() {
   const sheet = getSheet_();
   ensureHeader_(sheet);
+  ensureUniqueIds_(sheet);
 
   const lastRow = sheet.getLastRow();
   if (lastRow <= 1) return [];
 
-  const values = sheet.getRange(2, 1, lastRow - 1, 5).getValues();
-  const attendees = values
-    .filter(function(row) {
-      return String(row[0] || '').trim() && String(row[1] || '').trim();
-    })
-    .map(function(row) {
-      return {
-        id: String(row[0] || ''),
-        name: String(row[1] || ''),
-        address: String(row[2] || ''),
-        count: Number(row[3] || 1),
-        created_at: row[4] ? new Date(row[4]).toISOString() : ''
-      };
+  const values = sheet.getRange(2, 1, lastRow - 1, SHEET_HEADERS.length).getValues();
+  const attendees = [];
+  values.forEach(function(row, index) {
+    const rowNum = index + 2;
+    if (!String(row[0] || '').trim() || !String(row[1] || '').trim()) return;
+    attendees.push({
+      id: String(row[0] || ''),
+      name: String(row[1] || ''),
+      address: String(row[2] || ''),
+      count: Math.max(1, Number(row[3] || 1)),
+      created_at: row[4] ? new Date(row[4]).toISOString() : '',
+      row_num: rowNum
     });
+  });
 
   attendees.sort(function(a, b) {
     const da = a.created_at ? new Date(a.created_at).getTime() : 0;
@@ -87,6 +89,7 @@ function listAttendees_() {
 function createAttendees_(attendees) {
   const sheet = getSheet_();
   ensureHeader_(sheet);
+  ensureUniqueIds_(sheet);
 
   if (!Array.isArray(attendees) || attendees.length === 0) return;
 
@@ -95,7 +98,7 @@ function createAttendees_(attendees) {
     .filter(function(a) { return a && String(a.name || '').trim(); })
     .map(function(a) {
       return [
-        String(a.id || Utilities.getUuid()),
+        Utilities.getUuid(),
         String(a.name || '').trim(),
         String(a.address || '').trim(),
         Math.max(1, Number(a.count || 1)),
@@ -104,40 +107,61 @@ function createAttendees_(attendees) {
     });
 
   if (rows.length === 0) return;
-  sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, 5).setValues(rows);
+  sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, SHEET_HEADERS.length).setValues(rows);
 }
 
 function updateAttendee_(params) {
   const id = String(params.id || '').trim();
+  const rowNumParam = Number(params.row_num || 0);
   if (!id) throw new Error('id wajib diisi');
 
   const sheet = getSheet_();
   ensureHeader_(sheet);
-  const rowNum = findRowById_(sheet, id);
+  ensureUniqueIds_(sheet);
+  const rowNum = findRowByRef_(sheet, id, rowNumParam);
   if (!rowNum) throw new Error('Data tamu tidak ditemukan');
 
-  const current = sheet.getRange(rowNum, 1, 1, 5).getValues()[0];
+  const current = sheet.getRange(rowNum, 1, 1, SHEET_HEADERS.length).getValues()[0];
+  const persistedId = String(current[0] || id || Utilities.getUuid());
   const createdAt = String(params.created_at || '') || String(current[4] || new Date().toISOString());
 
-  sheet.getRange(rowNum, 1, 1, 5).setValues([[
-    id,
+  sheet.getRange(rowNum, 1, 1, SHEET_HEADERS.length).setValues([[
+    persistedId,
     String(params.name || '').trim(),
     String(params.address || '').trim(),
-    Math.max(1, Number(params.count || 1)),
+    Math.max(1, Number(params.count || current[3] || 1)),
     createdAt
   ]]);
 }
 
-function deleteAttendee_(id) {
+function deleteAttendee_(id, rowNumParam) {
   const attendeeId = String(id || '').trim();
   if (!attendeeId) throw new Error('id wajib diisi');
 
   const sheet = getSheet_();
   ensureHeader_(sheet);
-  const rowNum = findRowById_(sheet, attendeeId);
+  ensureUniqueIds_(sheet);
+  const rowNum = findRowByRef_(sheet, attendeeId, Number(rowNumParam || 0));
   if (!rowNum) throw new Error('Data tamu tidak ditemukan');
 
   sheet.deleteRow(rowNum);
+}
+
+function findRowByRef_(sheet, id, rowNumParam) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow <= 1) return null;
+
+  if (id) {
+    // Strict mode: when id exists, never fallback to row number.
+    // This prevents accidental edits/deletes to the wrong attendee.
+    return findRowById_(sheet, id);
+  }
+
+  if (rowNumParam && rowNumParam >= 2 && rowNumParam <= lastRow) {
+    return rowNumParam;
+  }
+
+  return null;
 }
 
 function findRowById_(sheet, id) {
@@ -149,6 +173,30 @@ function findRowById_(sheet, id) {
     if (String(idValues[i][0] || '') === id) return i + 2;
   }
   return null;
+}
+
+function ensureUniqueIds_(sheet) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow <= 1) return;
+
+  const idRange = sheet.getRange(2, 1, lastRow - 1, 1);
+  const idValues = idRange.getValues();
+  const seen = {};
+  let changed = false;
+
+  for (var i = 0; i < idValues.length; i++) {
+    const raw = String(idValues[i][0] || '').trim();
+    if (!raw || seen[raw]) {
+      idValues[i][0] = Utilities.getUuid();
+      changed = true;
+      continue;
+    }
+    seen[raw] = true;
+  }
+
+  if (changed) {
+    idRange.setValues(idValues);
+  }
 }
 
 function parseParams_(e) {

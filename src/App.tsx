@@ -30,11 +30,20 @@ interface Attendee {
   address: string;
   count: number;
   created_at?: string;
+  row_num?: number;
 }
 
-const EVENT_DATE = new Date('2026-03-29T09:00:00');
+interface ConfirmedAttendee extends Attendee {
+  uiKey: string;
+}
+
+const EVENT_DATE = new Date(2026, 2, 29, 9, 0, 0);
 const WHATSAPP_NUMBER = '6285330351335';
 const APPS_SCRIPT_URL = (import.meta.env.VITE_APPS_SCRIPT_URL || '').trim();
+
+if (!APPS_SCRIPT_URL) {
+  throw new Error('VITE_APPS_SCRIPT_URL wajib diisi di .env karena mode aplikasi menggunakan Apps Script penuh.');
+}
 
 async function parseJsonSafely(response: Response) {
   const raw = await response.text();
@@ -46,42 +55,84 @@ async function parseJsonSafely(response: Response) {
   }
 }
 
+function generateClientId() {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return `id-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function normalizeParticipantCounts(input: Partial<Attendee>) {
+  const count = Math.max(1, Number(input.count ?? 1));
+  return {
+    count,
+  };
+}
+
+function createEmptyAttendee(): Attendee {
+  return {
+    id: generateClientId(),
+    name: '',
+    address: '',
+    ...normalizeParticipantCounts({ count: 1 })
+  };
+}
+
+async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit = {}, timeoutMs = 12000) {
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(input, {
+      ...init,
+      signal: controller.signal,
+    });
+  } finally {
+    window.clearTimeout(timeoutId);
+  }
+}
+
+function getCountdownValue(targetDate: Date) {
+  const targetMs = targetDate.getTime();
+  if (Number.isNaN(targetMs)) {
+    return { days: 0, hours: 0, minutes: 0, seconds: 0 };
+  }
+
+  const diff = Math.max(0, targetMs - Date.now());
+  return {
+    days: Math.floor(diff / (1000 * 60 * 60 * 24)),
+    hours: Math.floor((diff / (1000 * 60 * 60)) % 24),
+    minutes: Math.floor((diff / 1000 / 60) % 60),
+    seconds: Math.floor((diff / 1000) % 60)
+  };
+}
+
 export default function App() {
   const audioRef = React.useRef<HTMLAudioElement | null>(null);
   const [needsMusicStart, setNeedsMusicStart] = useState(false);
-  const [attendees, setAttendees] = useState<Attendee[]>([
-    { id: '1', name: '', address: '', count: 1 }
-  ]);
-  const [confirmedAttendees, setConfirmedAttendees] = useState<Attendee[]>([]);
+  const [attendees, setAttendees] = useState<Attendee[]>([createEmptyAttendee()]);
+  const [confirmedAttendees, setConfirmedAttendees] = useState<ConfirmedAttendee[]>([]);
   const [isLoading, setIsLoading] = useState(true);
-  const [editingAttendeeId, setEditingAttendeeId] = useState<string | null>(null);
-  const [editDraft, setEditDraft] = useState<{ name: string; address: string; count: number; created_at?: string }>({
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [editingAttendeeKey, setEditingAttendeeKey] = useState<string | null>(null);
+  const [editDraft, setEditDraft] = useState<{
+    name: string;
+    address: string;
+    count: number;
+    created_at?: string;
+  }>({
     name: '',
     address: '',
     count: 1
   });
-  const [actionAttendeeId, setActionAttendeeId] = useState<string | null>(null);
-  const [timeLeft, setTimeLeft] = useState({
-    days: 0,
-    hours: 0,
-    minutes: 0,
-    seconds: 0
-  });
+  const [countDrafts, setCountDrafts] = useState<Record<string, string>>({});
+  const [editCountDraft, setEditCountDraft] = useState('1');
+  const [actionAttendeeKey, setActionAttendeeKey] = useState<string | null>(null);
+  const [timeLeft, setTimeLeft] = useState(getCountdownValue(EVENT_DATE));
 
   useEffect(() => {
     fetchAttendees();
     const timer = setInterval(() => {
-      const now = new Date();
-      const difference = EVENT_DATE.getTime() - now.getTime();
-
-      if (difference > 0) {
-        setTimeLeft({
-          days: Math.floor(difference / (1000 * 60 * 60 * 24)),
-          hours: Math.floor((difference / (1000 * 60 * 60)) % 24),
-          minutes: Math.floor((difference / 1000 / 60) % 60),
-          seconds: Math.floor((difference / 1000) % 60)
-        });
-      }
+      setTimeLeft(getCountdownValue(EVENT_DATE));
     }, 1000);
 
     return () => clearInterval(timer);
@@ -129,11 +180,17 @@ export default function App() {
     };
   }, []);
 
+  const buildUiKey = (attendee: Partial<Attendee>, index: number) =>
+    `${String(attendee.id || 'no-id')}::${String(attendee.row_num || 'no-row')}::${String(attendee.created_at || 'no-date')}::${index}`;
+
   const fetchAttendees = async () => {
+    setIsLoading(true);
     try {
-      const response = APPS_SCRIPT_URL
-        ? await fetch(`${APPS_SCRIPT_URL}?action=list`)
-        : await fetch('/api/attendees');
+      const cacheBuster = `_=${Date.now()}`;
+      const url = `${APPS_SCRIPT_URL}?action=list&${cacheBuster}`;
+      const response = await fetchWithTimeout(url, {
+        cache: 'no-store',
+      });
 
       const data = await parseJsonSafely(response);
       if (!response.ok || data?.success === false) {
@@ -141,9 +198,29 @@ export default function App() {
       }
 
       const rows = Array.isArray(data) ? data : data?.data;
-      setConfirmedAttendees(Array.isArray(rows) ? rows : []);
+      const normalizedRows: ConfirmedAttendee[] = Array.isArray(rows)
+        ? rows.map((row: Partial<Attendee>, index: number) => {
+            const normalizedCounts = normalizeParticipantCounts(row || {});
+            return {
+              id: String(row?.id || ''),
+              name: String(row?.name || ''),
+              address: String(row?.address || ''),
+              ...normalizedCounts,
+              created_at: row?.created_at ? String(row.created_at) : undefined,
+              row_num: Number(row?.row_num || 0) || undefined,
+              uiKey: buildUiKey(row || {}, index),
+            };
+          })
+        : [];
+      setConfirmedAttendees(normalizedRows);
+      setLoadError(null);
     } catch (error) {
       console.error("Error fetching confirmed attendees:", error);
+      setLoadError(
+        error instanceof Error
+          ? error.message
+          : 'Gagal memuat daftar tamu. Periksa koneksi internet lalu coba lagi.'
+      );
     } finally {
       setIsLoading(false);
     }
@@ -152,7 +229,7 @@ export default function App() {
   const addAttendee = () => {
     setAttendees([
       ...attendees,
-      { id: Math.random().toString(36).substr(2, 9), name: '', address: '', count: 1 }
+      createEmptyAttendee()
     ]);
   };
 
@@ -162,8 +239,38 @@ export default function App() {
     }
   };
 
-  const updateAttendee = (id: string, field: keyof Attendee, value: string | number) => {
+  const updateAttendeeField = (id: string, field: 'name' | 'address', value: string) => {
     setAttendees(attendees.map(a => a.id === id ? { ...a, [field]: value } : a));
+  };
+
+  const updateAttendeeTotal = (id: string, count: number) => {
+    setAttendees(attendees.map((a) => {
+      if (a.id !== id) return a;
+      const normalized = normalizeParticipantCounts({
+        count,
+      });
+      return { ...a, ...normalized };
+    }));
+  };
+
+  const sanitizeCountInput = (value: string) => value.replace(/[^\d]/g, '');
+
+  const commitCountDraft = (id: string) => {
+    const raw = countDrafts[id];
+    if (raw === undefined) return;
+    const normalized = normalizeParticipantCounts({ count: Number(raw || 1) });
+    updateAttendeeTotal(id, normalized.count);
+    setCountDrafts((prev) => {
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+  };
+
+  const getEffectiveCount = (attendee: Attendee) => {
+    const raw = countDrafts[attendee.id];
+    if (raw === undefined) return attendee.count;
+    return normalizeParticipantCounts({ count: Number(raw || 1) }).count;
   };
 
   const handleSendWhatsApp = async () => {
@@ -171,26 +278,26 @@ export default function App() {
     try {
       const validAttendees = attendees.filter(a => a.name.trim());
       if (validAttendees.length > 0) {
-        const response = APPS_SCRIPT_URL
-          ? await fetch(APPS_SCRIPT_URL, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
-              body: new URLSearchParams({
-                action: 'create',
-                attendees: JSON.stringify(validAttendees)
-              })
-            })
-          : await fetch('/api/attendees', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ attendees: validAttendees })
-            });
+        const attendeesToSave = validAttendees.map((attendee) => ({
+          ...attendee,
+          id: attendee.id || generateClientId(),
+          ...normalizeParticipantCounts({ count: getEffectiveCount(attendee) }),
+        }));
+        const response = await fetch(APPS_SCRIPT_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
+          body: new URLSearchParams({
+            action: 'create',
+            attendees: JSON.stringify(attendeesToSave)
+          })
+        });
 
         const data = await parseJsonSafely(response);
         if (!response.ok || data?.success === false) {
           throw new Error(data?.detail || data?.error || 'Gagal menyimpan daftar tamu.');
         }
-        fetchAttendees();
+        await fetchAttendees();
+        setAttendees([createEmptyAttendee()]);
       }
     } catch (error) {
       console.error("Error saving attendees:", error);
@@ -205,9 +312,10 @@ export default function App() {
 
     attendees.forEach((a, index) => {
       if (a.name.trim()) {
+        const normalized = normalizeParticipantCounts({ count: getEffectiveCount(a) });
         message += `${index + 1}. Nama : ${a.name}\n`;
         message += `   Alamat : ${a.address}\n`;
-        message += `   Jumlah hadir : ${a.count}\n\n`;
+        message += `   Jumlah hadir : ${normalized.count}\n\n`;
       }
     });
 
@@ -331,93 +439,93 @@ export default function App() {
     URL.revokeObjectURL(url);
   };
 
-  const startEditConfirmedAttendee = (attendee: Attendee) => {
-    setEditingAttendeeId(attendee.id);
+  const startEditConfirmedAttendee = (attendee: ConfirmedAttendee) => {
+    const normalized = normalizeParticipantCounts(attendee);
+    setEditingAttendeeKey(attendee.uiKey);
+    setEditCountDraft(String(normalized.count));
     setEditDraft({
       name: attendee.name,
       address: attendee.address,
-      count: attendee.count,
+      count: normalized.count,
       created_at: attendee.created_at
     });
   };
 
   const cancelEditConfirmedAttendee = () => {
-    setEditingAttendeeId(null);
+    setEditingAttendeeKey(null);
+    setEditCountDraft('1');
     setEditDraft({ name: '', address: '', count: 1 });
   };
 
-  const saveEditConfirmedAttendee = async (id: string) => {
+  const saveEditConfirmedAttendee = async (attendee: ConfirmedAttendee) => {
     if (!editDraft.name.trim()) {
       alert('Nama tamu wajib diisi.');
       return;
     }
+    if (!attendee.id) {
+      alert('ID tamu tidak valid. Muat ulang halaman lalu coba lagi.');
+      return;
+    }
 
-    setActionAttendeeId(id);
+    setActionAttendeeKey(attendee.uiKey);
     try {
-      const response = APPS_SCRIPT_URL
-        ? await fetch(APPS_SCRIPT_URL, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
-            body: new URLSearchParams({
-              action: 'update',
-              id,
-              name: editDraft.name.trim(),
-              address: editDraft.address.trim(),
-              count: String(Math.max(1, Number(editDraft.count || 1))),
-              created_at: editDraft.created_at || ''
-            })
-          })
-        : await fetch(`/api/attendees/${encodeURIComponent(id)}`, {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              name: editDraft.name.trim(),
-              address: editDraft.address.trim(),
-              count: Math.max(1, Number(editDraft.count || 1)),
-              created_at: editDraft.created_at
-            })
-          });
+      const normalized = normalizeParticipantCounts({ count: Number(editCountDraft || editDraft.count || 1) });
+      setEditCountDraft(String(normalized.count));
+      const response = await fetch(APPS_SCRIPT_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
+        body: new URLSearchParams({
+          action: 'update',
+          id: attendee.id,
+          row_num: String(attendee.row_num || ''),
+          name: editDraft.name.trim(),
+          address: editDraft.address.trim(),
+          count: String(normalized.count),
+          created_at: editDraft.created_at || ''
+        })
+      });
 
       const data = await parseJsonSafely(response);
       if (!response.ok || data?.success === false) {
         throw new Error(data?.detail || data?.error || 'Gagal mengedit data tamu.');
       }
 
-      setEditingAttendeeId(null);
+      setEditingAttendeeKey(null);
       await fetchAttendees();
     } catch (error) {
       console.error('Error updating attendee:', error);
       alert(error instanceof Error ? error.message : 'Gagal mengedit data tamu.');
     } finally {
-      setActionAttendeeId(null);
+      setActionAttendeeKey(null);
     }
   };
 
-  const deleteConfirmedAttendee = async (id: string) => {
+  const deleteConfirmedAttendee = async (attendee: ConfirmedAttendee) => {
     const isConfirmed = window.confirm('Hapus data tamu ini dari daftar?');
     if (!isConfirmed) return;
+    if (!attendee.id) {
+      alert('ID tamu tidak valid. Muat ulang halaman lalu coba lagi.');
+      return;
+    }
 
-    setActionAttendeeId(id);
+    setActionAttendeeKey(attendee.uiKey);
     try {
-      const response = APPS_SCRIPT_URL
-        ? await fetch(APPS_SCRIPT_URL, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
-            body: new URLSearchParams({
-              action: 'delete',
-              id
-            })
-          })
-        : await fetch(`/api/attendees/${encodeURIComponent(id)}`, {
-            method: 'DELETE'
-          });
+      const response = await fetch(APPS_SCRIPT_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
+        body: new URLSearchParams({
+          action: 'delete',
+          id: attendee.id,
+          row_num: String(attendee.row_num || '')
+        })
+      });
 
       const data = await parseJsonSafely(response);
       if (!response.ok || data?.success === false) {
         throw new Error(data?.detail || data?.error || 'Gagal menghapus data tamu.');
       }
 
-      if (editingAttendeeId === id) {
+      if (editingAttendeeKey === attendee.uiKey) {
         cancelEditConfirmedAttendee();
       }
       await fetchAttendees();
@@ -425,7 +533,7 @@ export default function App() {
       console.error('Error deleting attendee:', error);
       alert(error instanceof Error ? error.message : 'Gagal menghapus data tamu.');
     } finally {
-      setActionAttendeeId(null);
+      setActionAttendeeKey(null);
     }
   };
 
@@ -707,7 +815,7 @@ export default function App() {
                           placeholder="Nama lengkap sesuai nasab"
                           className="input-field"
                           value={attendee.name}
-                          onChange={(e) => updateAttendee(attendee.id, 'name', e.target.value)}
+                          onChange={(e) => updateAttendeeField(attendee.id, 'name', e.target.value)}
                         />
                       </div>
                       <div className="space-y-2">
@@ -717,23 +825,31 @@ export default function App() {
                           placeholder="Kota atau Kecamatan"
                           className="input-field"
                           value={attendee.address}
-                          onChange={(e) => updateAttendee(attendee.id, 'address', e.target.value)}
+                          onChange={(e) => updateAttendeeField(attendee.id, 'address', e.target.value)}
+                        />
+                      </div>
+                      <div className="space-y-2 md:col-span-2">
+                        <label className="text-xs font-bold uppercase tracking-widest text-primary/60">Jumlah Anggota Keluarga</label>
+                        <input
+                          type="text"
+                          inputMode="numeric"
+                          pattern="[0-9]*"
+                          min={1}
+                          className="input-field"
+                          value={countDrafts[attendee.id] ?? String(attendee.count)}
+                          onChange={(e) => {
+                            setCountDrafts((prev) => ({
+                              ...prev,
+                              [attendee.id]: sanitizeCountInput(e.target.value),
+                            }));
+                          }}
+                          onBlur={() => commitCountDraft(attendee.id)}
                         />
                       </div>
                       <div className="space-y-2 md:col-span-2">
                         <div className="flex justify-between items-center mb-2">
-                          <label className="text-xs font-bold uppercase tracking-widest text-primary/60">Jumlah Anggota Keluarga</label>
-                          <span className="text-accent font-bold">{attendee.count} Orang</span>
-                        </div>
-                        <div className="flex items-center gap-6">
-                          <input 
-                            type="range" 
-                            min="1" 
-                            max="15" 
-                            className="flex-1 accent-accent h-2 bg-neutral-100 rounded-lg appearance-none cursor-pointer"
-                            value={attendee.count}
-                            onChange={(e) => updateAttendee(attendee.id, 'count', parseInt(e.target.value))}
-                          />
+                          <label className="text-xs font-bold uppercase tracking-widest text-primary/60">Total Kehadiran</label>
+                          <span className="text-accent font-bold">{getEffectiveCount(attendee)} Orang</span>
                         </div>
                       </div>
                     </div>
@@ -772,6 +888,15 @@ export default function App() {
           <div className="w-16 h-1 bg-accent mx-auto mb-4"></div>
           <p className="text-neutral-500 italic">Jumlah pendaftar: {confirmedAttendees.length} Tamu</p>
           <p className="text-neutral-500 italic">Total: {confirmedAttendees.reduce((acc, curr) => acc + curr.count, 0)} Orang</p>
+          {loadError && (
+            <p className="mt-3 text-sm text-red-600">{loadError}</p>
+          )}
+          <button
+            onClick={fetchAttendees}
+            className="mt-3 inline-flex items-center gap-2 bg-accent/10 text-accent px-4 py-2 rounded-lg font-bold hover:bg-accent/20 transition-colors"
+          >
+            Muat Ulang Daftar Tamu
+          </button>
           <button
             onClick={handleDownloadGuestList}
             className="mt-5 inline-flex items-center gap-2 bg-primary text-gold px-4 py-2 rounded-lg font-bold hover:opacity-90 transition-opacity"
@@ -785,11 +910,11 @@ export default function App() {
             <div className="col-span-full text-center py-10 text-neutral-400">Memuat daftar tamu...</div>
           ) : confirmedAttendees.length > 0 ? (
             confirmedAttendees.map((attendee) => {
-              const isEditing = editingAttendeeId === attendee.id;
-              const isActing = actionAttendeeId === attendee.id;
+              const isEditing = editingAttendeeKey === attendee.uiKey;
+              const isActing = actionAttendeeKey === attendee.uiKey;
               return (
               <motion.div 
-                key={attendee.id}
+                key={attendee.uiKey}
                 initial={{ opacity: 0, scale: 0.95 }}
                 whileInView={{ opacity: 1, scale: 1 }}
                 viewport={{ once: true }}
@@ -813,11 +938,21 @@ export default function App() {
                         placeholder="Alamat"
                       />
                       <input
-                        type="number"
+                        type="text"
+                        inputMode="numeric"
+                        pattern="[0-9]*"
                         min={1}
-                        value={editDraft.count}
-                        onChange={(e) => setEditDraft({ ...editDraft, count: Number(e.target.value || 1) })}
+                        value={editCountDraft}
+                        onChange={(e) => {
+                          setEditCountDraft(sanitizeCountInput(e.target.value));
+                        }}
+                        onBlur={() => {
+                          const normalized = normalizeParticipantCounts({ count: Number(editCountDraft || 1) });
+                          setEditCountDraft(String(normalized.count));
+                          setEditDraft({ ...editDraft, ...normalized });
+                        }}
                         className="w-full border border-accent/30 rounded-md px-2 py-1 text-sm"
+                        placeholder="Jumlah hadir"
                       />
                     </div>
                   ) : (
@@ -835,14 +970,14 @@ export default function App() {
                       {attendee.created_at ? new Date(attendee.created_at).toLocaleDateString('id-ID') : ''}
                     </span>
                     <span className="bg-accent/10 text-accent text-xs font-bold px-2 py-1 rounded-full">
-                      {(isEditing ? editDraft.count : attendee.count)} Orang
+                      {(isEditing ? normalizeParticipantCounts({ count: Number(editCountDraft || editDraft.count || 1) }).count : attendee.count)} Orang
                     </span>
                   </div>
                   <div className="flex items-center justify-end gap-2">
                     {isEditing ? (
                       <>
                         <button
-                          onClick={() => saveEditConfirmedAttendee(attendee.id)}
+                          onClick={() => saveEditConfirmedAttendee(attendee)}
                           disabled={isActing}
                           className="px-2 py-1 text-xs rounded bg-primary text-gold font-bold disabled:opacity-50 inline-flex items-center gap-1"
                         >
@@ -866,7 +1001,7 @@ export default function App() {
                           <Pencil size={12} /> Edit
                         </button>
                         <button
-                          onClick={() => deleteConfirmedAttendee(attendee.id)}
+                          onClick={() => deleteConfirmedAttendee(attendee)}
                           disabled={isActing}
                           className="px-2 py-1 text-xs rounded bg-red-100 text-red-700 font-bold disabled:opacity-50 inline-flex items-center gap-1"
                         >

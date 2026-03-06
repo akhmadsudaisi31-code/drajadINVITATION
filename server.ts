@@ -1,5 +1,7 @@
 import express from "express";
 import { createServer as createViteServer } from "vite";
+import react from "@vitejs/plugin-react";
+import tailwindcss from "@tailwindcss/vite";
 import path from "path";
 import { fileURLToPath } from "url";
 import crypto from "crypto";
@@ -15,18 +17,33 @@ interface Attendee {
   name: string;
   address: string;
   count: number;
+  adult_count?: number;
+  child_count?: number;
   created_at?: string;
+  row_num?: number;
 }
 
 const PORT = Number(process.env.PORT) || 3000;
 const SPREADSHEET_ID = process.env.GOOGLE_SHEETS_SPREADSHEET_ID || "";
-const SHEET_RANGE = process.env.GOOGLE_SHEETS_RANGE || "attendees!A:E";
+const SHEET_RANGE = process.env.GOOGLE_SHEETS_RANGE || "attendees!A:G";
+const SHEET_NAME = (SHEET_RANGE.split("!")[0] || "attendees").trim();
+const SHEET_FULL_RANGE = `${SHEET_NAME}!A:G`;
 const SERVICE_ACCOUNT_EMAIL = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL || "";
 const PRIVATE_KEY = (process.env.GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY || "").replace(/\\n/g, "\n");
 const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
 const GOOGLE_SHEETS_API_BASE = "https://sheets.googleapis.com/v4/spreadsheets";
 
 let accessTokenCache: { token: string; expiresAt: number } | null = null;
+
+function normalizeParticipantCounts(input: Partial<Attendee>) {
+  const adult = Math.max(1, Number(input.adult_count ?? input.count ?? 1));
+  const child = Math.max(0, Number(input.child_count ?? 0));
+  return {
+    adult_count: adult,
+    child_count: child,
+    count: adult + child,
+  };
+}
 
 function getErrorMessage(error: unknown) {
   if (error instanceof Error) return error.message;
@@ -101,7 +118,7 @@ function validateGoogleSheetsConfig() {
 
 async function fetchAttendeesFromSheet(): Promise<Attendee[]> {
   const token = await getGoogleAccessToken();
-  const url = `${GOOGLE_SHEETS_API_BASE}/${encodeURIComponent(SPREADSHEET_ID)}/values/${encodeURIComponent(SHEET_RANGE)}`;
+  const url = `${GOOGLE_SHEETS_API_BASE}/${encodeURIComponent(SPREADSHEET_ID)}/values/${encodeURIComponent(SHEET_FULL_RANGE)}`;
   const response = await fetch(url, {
     headers: { Authorization: `Bearer ${token}` },
   });
@@ -120,13 +137,21 @@ async function fetchAttendeesFromSheet(): Promise<Attendee[]> {
       if (index !== 0) return true;
       return String(row[0]).toLowerCase() !== "id";
     })
-    .map((row) => ({
-      id: row[0] || crypto.randomUUID(),
-      name: row[1] || "",
-      address: row[2] || "",
-      count: Number(row[3] || 0),
-      created_at: row[4] || "",
-    }))
+    .map((row, index) => {
+      const normalized = normalizeParticipantCounts({
+        count: Number(row[3] || 0),
+        adult_count: Number(row[5] || 0) || undefined,
+        child_count: Number(row[6] || 0) || undefined,
+      });
+      return {
+        id: row[0] || crypto.randomUUID(),
+        name: row[1] || "",
+        address: row[2] || "",
+        ...normalized,
+        created_at: row[4] || "",
+        row_num: index + 1,
+      };
+    })
     .filter((a) => a.name.trim());
 
   // Keep latest entries first for UI consistency.
@@ -139,7 +164,7 @@ async function fetchAttendeesFromSheet(): Promise<Attendee[]> {
 
 async function findAttendeeRowById(attendeeId: string): Promise<number | null> {
   const token = await getGoogleAccessToken();
-  const url = `${GOOGLE_SHEETS_API_BASE}/${encodeURIComponent(SPREADSHEET_ID)}/values/${encodeURIComponent(SHEET_RANGE)}`;
+  const url = `${GOOGLE_SHEETS_API_BASE}/${encodeURIComponent(SPREADSHEET_ID)}/values/${encodeURIComponent(SHEET_FULL_RANGE)}`;
   const response = await fetch(url, {
     headers: { Authorization: `Bearer ${token}` },
   });
@@ -166,8 +191,7 @@ async function findAttendeeRowById(attendeeId: string): Promise<number | null> {
 
 async function clearAttendeeRow(rowNumber: number) {
   const token = await getGoogleAccessToken();
-  const sheetName = SHEET_RANGE.split("!")[0] || "attendees";
-  const rowRange = `${sheetName}!A${rowNumber}:E${rowNumber}`;
+  const rowRange = `${SHEET_NAME}!A${rowNumber}:G${rowNumber}`;
   const url = `${GOOGLE_SHEETS_API_BASE}/${encodeURIComponent(SPREADSHEET_ID)}/values/${encodeURIComponent(rowRange)}:clear`;
   const response = await fetch(url, {
     method: "POST",
@@ -186,8 +210,8 @@ async function clearAttendeeRow(rowNumber: number) {
 
 async function updateAttendeeRow(rowNumber: number, attendee: Attendee) {
   const token = await getGoogleAccessToken();
-  const sheetName = SHEET_RANGE.split("!")[0] || "attendees";
-  const rowRange = `${sheetName}!A${rowNumber}:E${rowNumber}`;
+  const rowRange = `${SHEET_NAME}!A${rowNumber}:G${rowNumber}`;
+  const normalized = normalizeParticipantCounts(attendee);
   const url = `${GOOGLE_SHEETS_API_BASE}/${encodeURIComponent(SPREADSHEET_ID)}/values/${encodeURIComponent(rowRange)}?valueInputOption=USER_ENTERED`;
 
   const response = await fetch(url, {
@@ -201,8 +225,10 @@ async function updateAttendeeRow(rowNumber: number, attendee: Attendee) {
         attendee.id,
         attendee.name,
         attendee.address,
-        attendee.count,
+        normalized.count,
         attendee.created_at || new Date().toISOString(),
+        normalized.adult_count,
+        normalized.child_count,
       ]],
     }),
   });
@@ -215,15 +241,20 @@ async function updateAttendeeRow(rowNumber: number, attendee: Attendee) {
 
 async function appendAttendeesToSheet(attendees: Attendee[]) {
   const token = await getGoogleAccessToken();
-  const url = `${GOOGLE_SHEETS_API_BASE}/${encodeURIComponent(SPREADSHEET_ID)}/values/${encodeURIComponent(SHEET_RANGE)}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`;
+  const url = `${GOOGLE_SHEETS_API_BASE}/${encodeURIComponent(SPREADSHEET_ID)}/values/${encodeURIComponent(SHEET_FULL_RANGE)}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`;
 
-  const values = attendees.map((attendee) => [
-    attendee.id,
-    attendee.name,
-    attendee.address,
-    attendee.count,
-    new Date().toISOString(),
-  ]);
+  const values = attendees.map((attendee) => {
+    const normalized = normalizeParticipantCounts(attendee);
+    return [
+      attendee.id,
+      attendee.name,
+      attendee.address,
+      normalized.count,
+      new Date().toISOString(),
+      normalized.adult_count,
+      normalized.child_count,
+    ];
+  });
 
   const response = await fetch(url, {
     method: "POST",
@@ -282,10 +313,10 @@ async function startServer() {
         attendees
           .filter((attendee) => attendee?.name?.trim())
           .map((attendee) => ({
-            id: attendee.id || crypto.randomUUID(),
+            id: crypto.randomUUID(),
             name: attendee.name,
             address: attendee.address || "",
-            count: Number(attendee.count || 1),
+            ...normalizeParticipantCounts(attendee),
           }))
       );
 
@@ -336,7 +367,7 @@ async function startServer() {
     }
 
     const attendeeId = String(req.params.id || "").trim();
-    const { name, address, count, created_at } = req.body as Partial<Attendee>;
+    const { name, address, count, adult_count, child_count, created_at } = req.body as Partial<Attendee>;
 
     if (!attendeeId) {
       return res.status(400).json({ error: "Attendee id is required" });
@@ -346,6 +377,7 @@ async function startServer() {
     }
 
     try {
+      // Strict by id to prevent updates landing on another row.
       const rowNumber = await findAttendeeRowById(attendeeId);
       if (!rowNumber) {
         return res.status(404).json({ error: "Attendee not found" });
@@ -355,7 +387,11 @@ async function startServer() {
         id: attendeeId,
         name: String(name).trim(),
         address: String(address || "").trim(),
-        count: Math.max(1, Number(count || 1)),
+        ...normalizeParticipantCounts({
+          count: Math.max(1, Number(count || 1)),
+          adult_count,
+          child_count,
+        }),
         created_at: created_at ? String(created_at) : undefined,
       });
 
@@ -372,7 +408,20 @@ async function startServer() {
   // Vite middleware for development
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      configFile: false,
+      plugins: [react(), tailwindcss()],
+      define: {
+        "process.env.GEMINI_API_KEY": JSON.stringify(process.env.GEMINI_API_KEY || ""),
+      },
+      resolve: {
+        alias: {
+          "@app": path.resolve(__dirname, "."),
+        },
+      },
+      server: {
+        middlewareMode: true,
+        hmr: process.env.DISABLE_HMR !== "true",
+      },
       appType: "spa",
     });
     app.use(vite.middlewares);

@@ -16,7 +16,7 @@
     "allowJs": true,
     "jsx": "react-jsx",
     "paths": {
-      "@/*": [
+      "@app/*": [
         "./*"
       ]
     },
