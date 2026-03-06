@@ -1,5 +1,6 @@
 const SHEET_NAME = 'attendees';
 const SHEET_HEADERS = ['id', 'name', 'address', 'count', 'created_at'];
+const SUBMISSION_TOKEN_PREFIX = 'submitted_token:';
 
 function doGet(e) {
   const action = (e && e.parameter && e.parameter.action) || 'list';
@@ -14,7 +15,7 @@ function doPost(e) {
 
     if (action === 'create') {
       const attendees = JSON.parse(params.attendees || '[]');
-      createAttendees_(attendees);
+      createAttendees_(attendees, params.client_token);
       return jsonOutput({ success: true });
     }
 
@@ -86,28 +87,42 @@ function listAttendees_() {
   return attendees;
 }
 
-function createAttendees_(attendees) {
+function createAttendees_(attendees, clientToken) {
   const sheet = getSheet_();
   ensureHeader_(sheet);
   ensureUniqueIds_(sheet);
+  const token = String(clientToken || '').trim();
+  if (!token) throw new Error('client_token wajib diisi');
 
   if (!Array.isArray(attendees) || attendees.length === 0) return;
 
-  const nowIso = new Date().toISOString();
-  const rows = attendees
-    .filter(function(a) { return a && String(a.name || '').trim(); })
-    .map(function(a) {
-      return [
-        Utilities.getUuid(),
-        String(a.name || '').trim(),
-        String(a.address || '').trim(),
-        Math.max(1, Number(a.count || 1)),
-        nowIso
-      ];
-    });
+  const lock = LockService.getScriptLock();
+  lock.waitLock(5000);
+  try {
+    if (isTokenSubmitted_(token)) {
+      throw new Error('Anda sudah pernah mengisi konfirmasi kehadiran.');
+    }
 
-  if (rows.length === 0) return;
-  sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, SHEET_HEADERS.length).setValues(rows);
+    const nowIso = new Date().toISOString();
+    const rows = attendees
+      .filter(function(a) { return a && String(a.name || '').trim(); })
+      .map(function(a) {
+        return [
+          Utilities.getUuid(),
+          String(a.name || '').trim(),
+          String(a.address || '').trim(),
+          Math.max(1, Number(a.count || 1)),
+          nowIso
+        ];
+      });
+
+    if (rows.length === 0) return;
+
+    sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, SHEET_HEADERS.length).setValues(rows);
+    markTokenSubmitted_(token);
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 function updateAttendee_(params) {
@@ -197,6 +212,16 @@ function ensureUniqueIds_(sheet) {
   if (changed) {
     idRange.setValues(idValues);
   }
+}
+
+function isTokenSubmitted_(token) {
+  const props = PropertiesService.getScriptProperties();
+  return props.getProperty(SUBMISSION_TOKEN_PREFIX + token) === '1';
+}
+
+function markTokenSubmitted_(token) {
+  const props = PropertiesService.getScriptProperties();
+  props.setProperty(SUBMISSION_TOKEN_PREFIX + token, '1');
 }
 
 function parseParams_(e) {

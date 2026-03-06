@@ -127,6 +127,10 @@ export default function App() {
   const [countDrafts, setCountDrafts] = useState<Record<string, string>>({});
   const [editCountDraft, setEditCountDraft] = useState('1');
   const [actionAttendeeKey, setActionAttendeeKey] = useState<string | null>(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [lastSubmittedAt, setLastSubmittedAt] = useState(0);
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [toastType, setToastType] = useState<'success' | 'error'>('success');
   const [timeLeft, setTimeLeft] = useState(getCountdownValue(EVENT_DATE));
 
   useEffect(() => {
@@ -274,6 +278,14 @@ export default function App() {
   };
 
   const handleSendWhatsApp = async () => {
+    const now = Date.now();
+    if (isSubmitting) return;
+    if (now - lastSubmittedAt < 5000) {
+      alert('Konfirmasi sedang diproses. Mohon tunggu sebentar.');
+      return;
+    }
+
+    setIsSubmitting(true);
     // Save to storage first
     try {
       const validAttendees = attendees.filter(a => a.name.trim());
@@ -298,10 +310,19 @@ export default function App() {
         }
         await fetchAttendees();
         setAttendees([createEmptyAttendee()]);
+        setLastSubmittedAt(Date.now());
+        setToastType('success');
+        setToastMessage('Konfirmasi berhasil dikirim.');
+        window.setTimeout(() => setToastMessage(null), 3000);
       }
     } catch (error) {
       console.error("Error saving attendees:", error);
       alert(error instanceof Error ? error.message : 'Gagal menyimpan daftar tamu.');
+      setToastType('error');
+      setToastMessage('Gagal mengirim konfirmasi. Silakan coba lagi.');
+      window.setTimeout(() => setToastMessage(null), 3000);
+      setIsSubmitting(false);
+      return;
     }
 
     let message = `Assalamu’alaikum Warahmatullahi Wabarakatuh.\n\n`;
@@ -323,6 +344,7 @@ export default function App() {
 
     const encodedMessage = encodeURIComponent(message);
     window.open(`https://wa.me/${WHATSAPP_NUMBER}?text=${encodedMessage}`, '_blank');
+    setIsSubmitting(false);
   };
 
   const handleDownloadGuestList = () => {
@@ -539,6 +561,15 @@ export default function App() {
 
   return (
     <div className="min-h-screen pb-20 overflow-x-hidden selection:bg-accent selection:text-white">
+      {toastMessage && (
+        <div
+          className={`fixed top-5 right-5 z-[60] px-4 py-3 rounded-lg shadow-lg text-sm font-bold ${
+            toastType === 'success' ? 'bg-emerald-600 text-white' : 'bg-red-600 text-white'
+          }`}
+        >
+          {toastMessage}
+        </div>
+      )}
       <audio ref={audioRef} src="/audio/aiduun-saeed.mp3" loop preload="auto" playsInline />
       {needsMusicStart && (
         <button
@@ -867,10 +898,11 @@ export default function App() {
               <div className="pt-10">
                 <button 
                   onClick={handleSendWhatsApp}
-                  className="btn-primary w-full py-6 text-xl group"
+                  disabled={isSubmitting}
+                  className="btn-primary w-full py-6 text-xl group disabled:opacity-60 disabled:cursor-not-allowed"
                 >
                   <Send size={24} className="group-hover:translate-x-1 group-hover:-translate-y-1 transition-transform" /> 
-                  Kirim Konfirmasi Kehadiran
+                  {isSubmitting ? 'Mengirim Konfirmasi...' : 'Kirim Konfirmasi Kehadiran'}
                 </button>
                 <p className="text-center text-xs text-secondary/50 mt-6 italic">
                   "Barangsiapa yang beriman kepada Allah dan hari akhir, maka hendaklah ia menyambung tali silaturahmi." (HR. Bukhari & Muslim)
