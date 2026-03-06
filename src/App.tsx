@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
   Calendar, 
@@ -40,6 +40,7 @@ interface ConfirmedAttendee extends Attendee {
 const EVENT_DATE = new Date(2026, 2, 29, 9, 0, 0);
 const WHATSAPP_NUMBER = '6285330351335';
 const APPS_SCRIPT_URL = (import.meta.env.VITE_APPS_SCRIPT_URL || '').trim();
+const CONFIRMED_PAGE_SIZE = 10;
 
 if (!APPS_SCRIPT_URL) {
   throw new Error('VITE_APPS_SCRIPT_URL wajib diisi di .env karena mode aplikasi menggunakan Apps Script penuh.');
@@ -63,7 +64,12 @@ function generateClientId() {
 }
 
 function normalizeParticipantCounts(input: Partial<Attendee>) {
-  const count = Math.max(1, Number(input.count ?? 1));
+  const rawCount = input.count as unknown;
+  const raw = typeof rawCount === 'string'
+    ? rawCount.replace(/[^\d.-]/g, '')
+    : rawCount;
+  const parsed = Number(raw ?? 1);
+  const count = Number.isFinite(parsed) ? Math.max(1, Math.round(parsed)) : 1;
   return {
     count,
   };
@@ -106,6 +112,16 @@ function getCountdownValue(targetDate: Date) {
   };
 }
 
+function toSafeTimestamp(value?: string) {
+  if (!value) return 0;
+  const ts = new Date(value).getTime();
+  return Number.isFinite(ts) ? ts : 0;
+}
+
+function getSortableCount(attendee: Partial<Attendee>) {
+  return normalizeParticipantCounts({ count: attendee.count }).count;
+}
+
 export default function App() {
   const audioRef = React.useRef<HTMLAudioElement | null>(null);
   const [needsMusicStart, setNeedsMusicStart] = useState(false);
@@ -131,7 +147,50 @@ export default function App() {
   const [lastSubmittedAt, setLastSubmittedAt] = useState(0);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [toastType, setToastType] = useState<'success' | 'error'>('success');
+  const [searchTerm, setSearchTerm] = useState('');
+  const [sortBy, setSortBy] = useState<'newest' | 'oldest' | 'name_asc' | 'count_desc'>('newest');
+  const [currentPage, setCurrentPage] = useState(1);
   const [timeLeft, setTimeLeft] = useState(getCountdownValue(EVENT_DATE));
+
+  const filteredSortedAttendees = useMemo(() => {
+    const keyword = searchTerm.trim().toLowerCase();
+    const filtered = keyword
+      ? confirmedAttendees.filter((attendee) =>
+          attendee.name.toLowerCase().includes(keyword) ||
+          attendee.address.toLowerCase().includes(keyword)
+        )
+      : confirmedAttendees;
+
+    const sorted = [...filtered];
+    sorted.sort((a, b) => {
+      const aDate = toSafeTimestamp(a.created_at);
+      const bDate = toSafeTimestamp(b.created_at);
+      const aCount = getSortableCount(a);
+      const bCount = getSortableCount(b);
+      const nameCompare = a.name.localeCompare(b.name, 'id', { sensitivity: 'base', numeric: true });
+      const rowCompare = (a.row_num || 0) - (b.row_num || 0);
+
+      switch (sortBy) {
+        case 'oldest':
+          return (aDate - bDate) || nameCompare || rowCompare;
+        case 'name_asc':
+          return nameCompare || (bDate - aDate) || rowCompare;
+        case 'count_desc':
+          return (bCount - aCount) || (bDate - aDate) || nameCompare || rowCompare;
+        case 'newest':
+        default:
+          return (bDate - aDate) || nameCompare || rowCompare;
+      }
+    });
+    return sorted;
+  }, [confirmedAttendees, searchTerm, sortBy]);
+
+  const totalFilteredPages = Math.max(1, Math.ceil(filteredSortedAttendees.length / CONFIRMED_PAGE_SIZE));
+  const safeCurrentPage = Math.min(currentPage, totalFilteredPages);
+  const paginatedAttendees = useMemo(() => {
+    const start = (safeCurrentPage - 1) * CONFIRMED_PAGE_SIZE;
+    return filteredSortedAttendees.slice(start, start + CONFIRMED_PAGE_SIZE);
+  }, [filteredSortedAttendees, safeCurrentPage]);
 
   useEffect(() => {
     fetchAttendees();
@@ -141,6 +200,16 @@ export default function App() {
 
     return () => clearInterval(timer);
   }, []);
+
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [searchTerm, sortBy]);
+
+  useEffect(() => {
+    if (currentPage > totalFilteredPages) {
+      setCurrentPage(totalFilteredPages);
+    }
+  }, [currentPage, totalFilteredPages]);
 
   useEffect(() => {
     const audio = audioRef.current;
@@ -217,6 +286,7 @@ export default function App() {
           })
         : [];
       setConfirmedAttendees(normalizedRows);
+      setCurrentPage(1);
       setLoadError(null);
     } catch (error) {
       console.error("Error fetching confirmed attendees:", error);
@@ -920,9 +990,29 @@ export default function App() {
           <div className="w-16 h-1 bg-accent mx-auto mb-4"></div>
           <p className="text-neutral-500 italic">Jumlah pendaftar: {confirmedAttendees.length} Tamu</p>
           <p className="text-neutral-500 italic">Total: {confirmedAttendees.reduce((acc, curr) => acc + curr.count, 0)} Orang</p>
+          <p className="text-neutral-500 italic">Hasil filter: {filteredSortedAttendees.length} Tamu</p>
           {loadError && (
             <p className="mt-3 text-sm text-red-600">{loadError}</p>
           )}
+          <div className="mt-4 grid sm:grid-cols-2 gap-3">
+            <input
+              type="text"
+              value={searchTerm}
+              onChange={(e) => setSearchTerm(e.target.value)}
+              className="w-full border border-accent/30 rounded-lg px-3 py-2 text-sm"
+              placeholder="Cari nama atau alamat..."
+            />
+            <select
+              value={sortBy}
+              onChange={(e) => setSortBy(e.target.value as 'newest' | 'oldest' | 'name_asc' | 'count_desc')}
+              className="w-full border border-accent/30 rounded-lg px-3 py-2 text-sm bg-white"
+            >
+              <option value="newest">Urutkan: Terbaru</option>
+              <option value="oldest">Urutkan: Terlama</option>
+              <option value="name_asc">Urutkan: Nama A-Z</option>
+              <option value="count_desc">Urutkan: Jumlah Terbanyak</option>
+            </select>
+          </div>
           <button
             onClick={fetchAttendees}
             className="mt-3 inline-flex items-center gap-2 bg-accent/10 text-accent px-4 py-2 rounded-lg font-bold hover:bg-accent/20 transition-colors"
@@ -940,8 +1030,8 @@ export default function App() {
         <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
           {isLoading ? (
             <div className="col-span-full text-center py-10 text-neutral-400">Memuat daftar tamu...</div>
-          ) : confirmedAttendees.length > 0 ? (
-            confirmedAttendees.map((attendee) => {
+          ) : filteredSortedAttendees.length > 0 ? (
+            paginatedAttendees.map((attendee) => {
               const isEditing = editingAttendeeKey === attendee.uiKey;
               const isActing = actionAttendeeKey === attendee.uiKey;
               return (
@@ -1050,6 +1140,27 @@ export default function App() {
             <div className="col-span-full text-center py-10 text-neutral-400 italic">Belum ada tamu yang mengonfirmasi.</div>
           )}
         </div>
+        {!isLoading && filteredSortedAttendees.length > CONFIRMED_PAGE_SIZE && (
+          <div className="mt-6 flex items-center justify-center gap-3">
+            <button
+              onClick={() => setCurrentPage((prev) => Math.max(1, prev - 1))}
+              disabled={safeCurrentPage <= 1}
+              className="px-3 py-2 rounded-md bg-accent/10 text-accent font-bold disabled:opacity-40"
+            >
+              Sebelumnya
+            </button>
+            <span className="text-sm text-neutral-500">
+              Halaman {safeCurrentPage} / {totalFilteredPages}
+            </span>
+            <button
+              onClick={() => setCurrentPage((prev) => Math.min(totalFilteredPages, prev + 1))}
+              disabled={safeCurrentPage >= totalFilteredPages}
+              className="px-3 py-2 rounded-md bg-accent/10 text-accent font-bold disabled:opacity-40"
+            >
+              Berikutnya
+            </button>
+          </div>
+        )}
       </section>
 
       {/* Footer */}
